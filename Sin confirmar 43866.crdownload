@@ -1,0 +1,151 @@
+"""
+clean_sales.py - Clean a messy sales spreadsheet and build a ready-to-send Excel report.
+
+Usage:
+    python clean_sales.py sales_BEFORE_messy.xlsx sales_AFTER_report.xlsx
+"""
+import sys
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
+from openpyxl.styles import Font, PatternFill, Alignment
+
+FONT = "Arial"
+HEADER_FILL = PatternFill("solid", start_color="1F4E78")
+MONEY = '"$"#,##0.00'
+
+
+def load_raw(path):
+    raw = pd.read_excel(path, header=None, dtype=object)
+    header_row = raw.index[raw.apply(lambda r: r.astype(str).str.strip().eq("Date").any(), axis=1)][0]
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = [str(c).strip() for c in raw.iloc[header_row]]
+    return df.reset_index(drop=True)
+
+
+def parse_dates(series):
+    """Try each known date format explicitly (avoids day/month mix-ups on ISO dates)."""
+    text = series.astype(str).str.strip()
+    out = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%b %d, %Y", "%Y-%m-%d %H:%M:%S"):
+        out = out.fillna(pd.to_datetime(text, format=fmt, errors="coerce"))
+    return out
+
+
+def clean(df):
+    log = {"Rows read": len(df)}
+
+    df = df.dropna(how="all")
+    log["Blank rows removed"] = log["Rows read"] - len(df)
+
+    for col in ("Salesperson", "Product"):
+        df[col] = df[col].astype(str).str.strip().str.title()
+    df["Date"] = parse_dates(df["Date"])
+    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
+    df["Unit Price"] = pd.to_numeric(
+        df["Unit Price"].astype(str).str.replace(r"[$,\s]", "", regex=True), errors="coerce")
+
+    before = len(df)
+    df = df.dropna(subset=["Date", "Quantity", "Unit Price"])
+    log["Rows removed (missing or invalid date/quantity/price)"] = before - len(df)
+
+    before = len(df)
+    df = df.drop_duplicates(subset=["Date", "Salesperson", "Product", "Quantity", "Unit Price"])
+    log["Duplicate rows removed"] = before - len(df)
+
+    df = df[["Date", "Salesperson", "Product", "Quantity", "Unit Price"]].sort_values("Date")
+    log["Clean rows"] = len(df)
+    return df.reset_index(drop=True), log
+
+
+def style_header(ws, ncols):
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.font = Font(name=FONT, bold=True, color="FFFFFF")
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center")
+
+
+def set_font(ws):
+    for row in ws.iter_rows():
+        for cell in row:
+            if not (cell.row == 1 and cell.fill == HEADER_FILL):
+                cell.font = Font(name=FONT, bold=cell.font.bold)
+
+
+def summary_sheet(wb, title, label, keys, key_col, n):
+    ws = wb.create_sheet(title)
+    ws.append([label, "Revenue", "Units"])
+    for i, k in enumerate(keys, start=2):
+        ws.cell(row=i, column=1, value=k)
+        ws.cell(row=i, column=2, value=f"=SUMIFS('Clean Data'!$F$2:$F${n+1},'Clean Data'!${key_col}$2:${key_col}${n+1},A{i})")
+        ws.cell(row=i, column=3, value=f"=SUMIFS('Clean Data'!$D$2:$D${n+1},'Clean Data'!${key_col}$2:${key_col}${n+1},A{i})")
+        ws.cell(row=i, column=2).number_format = MONEY
+    last = len(keys) + 1
+    ws.cell(row=last + 1, column=1, value="TOTAL")
+    ws.cell(row=last + 1, column=2, value=f"=SUM(B2:B{last})").number_format = MONEY
+    ws.cell(row=last + 1, column=3, value=f"=SUM(C2:C{last})")
+    style_header(ws, 3)
+    set_font(ws)
+    for c in range(1, 4):
+        ws.cell(row=last + 1, column=c).font = Font(name=FONT, bold=True)
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 16
+    ws.column_dimensions["C"].width = 10
+
+    chart = BarChart()
+    chart.title = f"Revenue by {label.lower()}"
+    chart.y_axis.title = "Revenue ($)"
+    chart.add_data(Reference(ws, min_col=2, min_row=1, max_row=last), titles_from_data=True)
+    chart.set_categories(Reference(ws, min_col=1, min_row=2, max_row=last))
+    chart.legend = None
+    chart.width, chart.height = 18, 9
+    ws.add_chart(chart, "E2")
+    return ws
+
+
+def build_report(df, log, out):
+    n = len(df)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Clean Data"
+    ws.append(["Date", "Salesperson", "Product", "Quantity", "Unit Price", "Total", "Month"])
+    for i, r in enumerate(df.itertuples(index=False), start=2):
+        ws.cell(row=i, column=1, value=r.Date.to_pydatetime()).number_format = "yyyy-mm-dd"
+        ws.cell(row=i, column=2, value=r.Salesperson)
+        ws.cell(row=i, column=3, value=r.Product)
+        ws.cell(row=i, column=4, value=int(r.Quantity))
+        ws.cell(row=i, column=5, value=float(r._4)).number_format = MONEY
+        ws.cell(row=i, column=6, value=f"=D{i}*E{i}").number_format = MONEY
+        ws.cell(row=i, column=7, value=f'=TEXT(A{i},"yyyy-mm")')
+    style_header(ws, 7)
+    set_font(ws)
+    for col, w in zip("ABCDEFG", (13, 14, 24, 10, 12, 12, 10)):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:G{n+1}"
+
+    months = sorted(df["Date"].dt.strftime("%Y-%m").unique())
+    summary_sheet(wb, "Monthly Summary", "Month", months, "G", n)
+    summary_sheet(wb, "By Salesperson", "Salesperson", sorted(df["Salesperson"].unique()), "B", n)
+    summary_sheet(wb, "By Product", "Product", sorted(df["Product"].unique()), "C", n)
+
+    lg = wb.create_sheet("Cleaning Log")
+    lg.append(["Step", "Count"])
+    for k, v in log.items():
+        lg.append([k, v])
+    lg.append([])
+    lg.append(["Note: counts above come from the Python cleaning script; every figure in the other sheets is an Excel formula."])
+    style_header(lg, 2)
+    set_font(lg)
+    lg.column_dimensions["A"].width = 58
+    wb.save(out)
+
+
+if __name__ == "__main__":
+    src, dst = sys.argv[1], sys.argv[2]
+    clean_df, log = clean(load_raw(src))
+    build_report(clean_df, log, dst)
+    for k, v in log.items():
+        print(f"{k}: {v}")
+    print("Saved:", dst)
